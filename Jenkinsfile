@@ -13,8 +13,8 @@
 def buildAgentName(String jobNameWithNamespace, String buildNumber, String namespace) {
     def jobName = removeNamespaceFromJobName(jobNameWithNamespace, namespace);
 
-    if (jobName.length() > 55) {
-        jobName = jobName.substring(0, 55);
+    if (jobName.length() > 52) {
+        jobName = jobName.substring(0, 52);
     }
 
     return "a.${jobName}${buildNumber}".replace('_', '-').replace('/', '-').replace('-.', '.');
@@ -45,9 +45,12 @@ apiVersion: v1
 kind: Pod
 spec:
   serviceAccountName: jenkins
+  volumes:
+    - emptyDir: {}
+      name: varlibcontainers
   containers:
     - name: jdk11
-      image: jenkins/slave:latest-jdk11
+      image: maven:3.6.3-jdk-11-slim
       tty: true
       command: ["/bin/bash"]
       workingDir: ${workingDir}
@@ -96,8 +99,46 @@ spec:
             secretKeyRef:
               name: ${secretName}
               key: password
+    - name: buildah
+      image: quay.io/buildah/stable:v1.11.0
+      tty: true
+      command: ["/bin/bash"]
+      workingDir: ${workingDir}
+      securityContext:
+        privileged: true
+      envFrom:
+        - configMapRef:
+            name: ibmcloud-config
+        - secretRef:
+            name: ibmcloud-apikey
+      env:
+        - name: HOME
+          value: /home/devops
+        - name: ENVIRONMENT_NAME
+          value: ${env.NAMESPACE}
+        - name: DOCKERFILE
+          value: ./Dockerfile
+        - name: CONTEXT
+          value: .
+        - name: TLSVERIFY
+          value: "false"
+        - name: REGISTRY_USER
+          valueFrom:
+            secretKeyRef:
+              key: REGISTRY_USER
+              name: ibmcloud-apikey
+              optional: true
+        - name: REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: APIKEY
+              name: ibmcloud-apikey
+              optional: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
     - name: ibmcloud
-      image: docker.io/garagecatalyst/ibmcloud-dev:1.0.8
+      image: docker.io/garagecatalyst/ibmcloud-dev:1.0.10
       tty: true
       command: ["/bin/bash"]
       workingDir: ${workingDir}
@@ -126,7 +167,7 @@ spec:
         - name: BUILD_NUMBER
           value: ${env.BUILD_NUMBER}
     - name: trigger-cd
-      image: docker.io/garagecatalyst/ibmcloud-dev:1.0.8
+      image: docker.io/garagecatalyst/ibmcloud-dev:1.0.10
       tty: true
       command: ["/bin/bash"]
       workingDir: ${workingDir}
@@ -144,23 +185,12 @@ spec:
             checkout scm
             stage('Build') {
                 sh '''
-                    ./gradlew assemble --no-daemon
+                    mvn package
                 '''
             }
             stage('Test') {
                 sh '''#!/bin/bash
-                    ./gradlew testClasses --no-daemon
-                '''
-            }
-            stage('Sonar scan') {
-                sh '''#!/bin/bash
-
-                if [[ -z "${SONARQUBE_URL}" ]]; then
-                  echo "Skipping Sonar Qube step as Sonar Qube not installed or configured"
-                  exit 0
-                fi
-
-                ./gradlew -Dsonar.login=${SONARQUBE_USER} -Dsonar.password=${SONARQUBE_PASSWORD} -Dsonar.host.url=${SONARQUBE_URL} sonarqube
+                    mvn test
                 '''
             }
         }
@@ -190,6 +220,7 @@ spec:
                     release-it patch ${PRE_RELEASE} \
                       --ci \
                       --no-npm \
+                      --no-git.requireCleanWorkingDir \
                       --verbose \
                       -VV
 
@@ -200,16 +231,26 @@ spec:
                 '''
             }
         }
-        container(name: 'ibmcloud', shell: '/bin/bash') {
+	      container(name: 'buildah', shell: '/bin/bash') {
             stage('Build image') {
                 sh '''#!/bin/bash
+                    set -e
                     . ./env-config
 
-                    echo -e "=========================================================================================="
-                    echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
-                    ibmcloud cr build -t ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION} .
+		    echo TLSVERIFY=${TLSVERIFY}
+		    echo CONTEXT=${CONTEXT}
+
+                    APP_IMAGE="${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
+
+                    buildah bud --tls-verify=${TLSVERIFY} --format=docker -f ${DOCKERFILE} -t ${APP_IMAGE} ${CONTEXT}
+                    if [[ -n "${REGISTRY_USER}" ]] && [[ -n "${REGISTRY_PASSWORD}" ]]; then
+                        buildah login -u "${REGISTRY_USER}" -p "${REGISTRY_PASSWORD}" "${REGISTRY_URL}"
+                    fi
+                    buildah push --tls-verify=${TLSVERIFY} "${APP_IMAGE}" "docker://${APP_IMAGE}"
                 '''
             }
+        }
+        container(name: 'ibmcloud', shell: '/bin/bash') {
             stage('Deploy to DEV env') {
                 sh '''#!/bin/bash
                     . ./env-config
@@ -231,7 +272,7 @@ spec:
 
                     echo "INITIALIZING helm with client-only (no Tiller)"
                     helm init --client-only 1> /dev/null 2> /dev/null
-                    
+
                     echo "CHECKING CHART (lint)"
                     helm lint ${CHART_PATH}
 
@@ -260,10 +301,10 @@ spec:
                         --namespace ${ENVIRONMENT_NAME} \
                         --set ingress.tlsSecretName="${TLS_SECRET_NAME}" \
                         --set ingress.subdomain="${INGRESS_SUBDOMAIN}" > ./release.yaml
-                    
+
                     echo -e "Generated release yaml for: ${CLUSTER_NAME}/${ENVIRONMENT_NAME}."
                     cat ./release.yaml
-                    
+
                     echo -e "Deploying into: ${CLUSTER_NAME}/${ENVIRONMENT_NAME}."
                     kubectl apply -n ${ENVIRONMENT_NAME} -f ./release.yaml --validate=false
                 '''
